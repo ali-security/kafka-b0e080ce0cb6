@@ -3317,7 +3317,7 @@ public class RequestResponseTest {
     }
 
     private AlterConfigsRequest createAlterConfigsRequest(short version) {
-        Map<ConfigResource, AlterConfigsRequest.Config> configs = new HashMap<>();
+        Map<ConfigResource, AlterConfigsRequest.Config> configs = new LinkedHashMap<>();
         List<AlterConfigsRequest.ConfigEntry> configEntries = asList(
                 new AlterConfigsRequest.ConfigEntry("config_name", "config_value"),
                 new AlterConfigsRequest.ConfigEntry("another_name", "another value")
@@ -3325,7 +3325,19 @@ public class RequestResponseTest {
         configs.put(new ConfigResource(ConfigResource.Type.BROKER, "0"), new AlterConfigsRequest.Config(configEntries));
         configs.put(new ConfigResource(ConfigResource.Type.TOPIC, "topic"),
                 new AlterConfigsRequest.Config(emptyList()));
-        return new AlterConfigsRequest.Builder(configs, false).build(version);
+        AlterConfigsRequest alterConfigsRequest = new AlterConfigsRequest.Builder(configs, false).build(version);
+        assertEquals(
+                "AlterConfigsRequestData(resources=[" +
+                        "AlterConfigsResource(resourceType=" + ConfigResource.Type.BROKER.id() + ", " +
+                        "resourceName='0', " +
+                        "configs=[AlterableConfig(name='config_name', value='REDACTED'), " +
+                        "AlterableConfig(name='another_name', value='REDACTED')]), " +
+                        "AlterConfigsResource(resourceType=" + ConfigResource.Type.TOPIC.id() + ", " +
+                        "resourceName='topic', configs=[])], " +
+                        "validateOnly=false)",
+                alterConfigsRequest.toString()
+        );
+        return alterConfigsRequest;
     }
 
     private AlterConfigsResponse createAlterConfigsResponse() {
@@ -3428,7 +3440,12 @@ public class RequestResponseTest {
                 .setMaxTimestampMs(System.currentTimeMillis())
                 .setTokenId("token1")
                 .setHmac("test".getBytes());
-        return new CreateDelegationTokenResponse(data);
+        CreateDelegationTokenResponse response = new CreateDelegationTokenResponse(data);
+
+        String responseStr = response.toString();
+        assertTrue(responseStr.contains("tokenId='REDACTED'"));
+        assertTrue(responseStr.contains("hmac=[]"));
+        return response;
     }
 
     private RenewDelegationTokenRequest createRenewTokenRequest(short version) {
@@ -3484,7 +3501,14 @@ public class RequestResponseTest {
         tokenList.add(new DelegationToken(tokenInfo1, "test".getBytes()));
         tokenList.add(new DelegationToken(tokenInfo2, "test".getBytes()));
 
-        return new DescribeDelegationTokenResponse(version, 20, Errors.NONE, tokenList);
+        DescribeDelegationTokenResponse response = new DescribeDelegationTokenResponse(version, 20, Errors.NONE, tokenList);
+
+        String responseStr = response.toString();
+        String[] parts = responseStr.split(",");
+        // The 2 token info should both be redacted
+        assertEquals(2, Arrays.stream(parts).filter(s -> s.trim().contains("tokenId='REDACTED'")).count());
+        assertEquals(2, Arrays.stream(parts).filter(s -> s.trim().contains("hmac=[]")).count());
+        return response;
     }
 
     private ElectLeadersRequest createElectLeadersRequestNullPartitions() {
@@ -4100,5 +4124,180 @@ public class RequestResponseTest {
         String msg = assertThrows(RuntimeException.class, () -> AbstractRequest.
                 parseRequest(SASL_AUTHENTICATE, SASL_AUTHENTICATE.latestVersion(), accessor.buffer())).getMessage();
         assertEquals("Error reading byte array of 32767 byte(s): only 3 byte(s) available", msg);
+    }
+
+    @Test
+    public void testSaslAuthenticateRequestResponseToStringMasksSensitiveData() {
+        byte[] sensitiveAuthBytes = "sensitive-auth-token-123".getBytes(StandardCharsets.UTF_8);
+        SaslAuthenticateRequestData requestData = new SaslAuthenticateRequestData().setAuthBytes(sensitiveAuthBytes);
+        SaslAuthenticateRequest request = new SaslAuthenticateRequest(requestData, (short) 2);
+
+        String requestString = request.toString();
+
+        // Verify that the authBytes field is present but empty in the output
+        assertTrue(requestString.contains("authBytes=[]"),
+                "authBytes field should be empty in toString() output");
+
+        SaslAuthenticateResponseData responseData = new SaslAuthenticateResponseData().setAuthBytes(sensitiveAuthBytes);
+        SaslAuthenticateResponse response = new SaslAuthenticateResponse(responseData);
+
+        String responseString = response.toString();
+
+        // Verify that the authBytes field is present but empty in the output
+        assertTrue(responseString.contains("authBytes=[]"),
+                "authBytes field should be empty in toString() output");
+        assertFalse(requestString.contains(Arrays.toString(sensitiveAuthBytes)));
+        assertFalse(responseString.contains(Arrays.toString(sensitiveAuthBytes)));
+        // The original data must not be modified by toString()
+        assertEquals(Arrays.toString(sensitiveAuthBytes), Arrays.toString(request.data().authBytes()));
+        assertEquals(Arrays.toString(sensitiveAuthBytes), Arrays.toString(response.data().authBytes()));
+    }
+
+    @Test
+    public void testAlterConfigsRequestBuilderToStringMasksConfigValues() {
+        String sensitiveValue = "sensitive-config-value";
+        Map<ConfigResource, AlterConfigsRequest.Config> configs = new LinkedHashMap<>();
+        configs.put(new ConfigResource(ConfigResource.Type.BROKER, "0"), new AlterConfigsRequest.Config(
+                singletonList(new AlterConfigsRequest.ConfigEntry("ssl.keystore.password", sensitiveValue))));
+        AlterConfigsRequest.Builder builder = new AlterConfigsRequest.Builder(configs, false);
+        AlterConfigsRequest request = builder.build();
+
+        for (String str : asList(builder.toString(), request.toString())) {
+            assertTrue(str.contains("name='ssl.keystore.password'"), str);
+            assertTrue(str.contains("value='REDACTED'"), str);
+            assertFalse(str.contains(sensitiveValue), str);
+        }
+        // The original data must not be modified by toString()
+        assertEquals(sensitiveValue, request.data().resources().iterator().next().configs().iterator().next().value());
+    }
+
+    @Test
+    public void testIncrementalAlterConfigsRequestToStringMasksConfigValues() {
+        String sensitiveValue = "sensitive-config-value";
+        IncrementalAlterConfigsRequestData data = new IncrementalAlterConfigsRequestData().setValidateOnly(true);
+        IncrementalAlterConfigsRequestData.AlterableConfigCollection loggerConfigs =
+                new IncrementalAlterConfigsRequestData.AlterableConfigCollection();
+        loggerConfigs.add(new AlterableConfig()
+                .setName("root")
+                .setConfigOperation((byte) 0)
+                .setValue("TRACE"));
+        data.resources().add(new AlterConfigsResource()
+                .setResourceType(ConfigResource.Type.BROKER_LOGGER.id())
+                .setResourceName("1")
+                .setConfigs(loggerConfigs));
+        IncrementalAlterConfigsRequestData.AlterableConfigCollection brokerConfigs =
+                new IncrementalAlterConfigsRequestData.AlterableConfigCollection();
+        brokerConfigs.add(new AlterableConfig()
+                .setName("ssl.keystore.password")
+                .setConfigOperation((byte) 0)
+                .setValue(sensitiveValue));
+        data.resources().add(new AlterConfigsResource()
+                .setResourceType(ConfigResource.Type.BROKER.id())
+                .setResourceName("0")
+                .setConfigs(brokerConfigs));
+        IncrementalAlterConfigsRequest.Builder builder = new IncrementalAlterConfigsRequest.Builder(data);
+        IncrementalAlterConfigsRequest request = builder.build((short) 1);
+
+        String expected = "IncrementalAlterConfigsRequestData(resources=[" +
+                "AlterConfigsResource(resourceType=" + ConfigResource.Type.BROKER_LOGGER.id() + ", " +
+                "resourceName='1', " +
+                "configs=[AlterableConfig(name='root', configOperation=0, value='REDACTED')]), " +
+                "AlterConfigsResource(resourceType=" + ConfigResource.Type.BROKER.id() + ", " +
+                "resourceName='0', " +
+                "configs=[AlterableConfig(name='ssl.keystore.password', configOperation=0, value='REDACTED')])], " +
+                "validateOnly=true)";
+        assertEquals(expected, request.toString());
+        assertEquals(expected, builder.toString());
+        assertFalse(request.toString().contains(sensitiveValue));
+        assertFalse(builder.toString().contains(sensitiveValue));
+        // The original data must not be modified by toString()
+        assertEquals(sensitiveValue, request.data().resources()
+                .find(ConfigResource.Type.BROKER.id(), "0").configs().iterator().next().value());
+
+        assertEquals("IncrementalAlterConfigsRequestData(resources=[], validateOnly=false)",
+                new IncrementalAlterConfigsRequest(new IncrementalAlterConfigsRequestData(), (short) 1).toString());
+    }
+
+    @Test
+    public void testAlterUserScramCredentialsRequestToStringMasksSaltAndSaltedPassword() {
+        byte[] salt = "sensitive-salt".getBytes(StandardCharsets.UTF_8);
+        byte[] saltedPassword = "sensitive-salted-password".getBytes(StandardCharsets.UTF_8);
+        AlterUserScramCredentialsRequestData data = new AlterUserScramCredentialsRequestData()
+                .setDeletions(singletonList(new AlterUserScramCredentialsRequestData.ScramCredentialDeletion()
+                        .setName("user2")
+                        .setMechanism((byte) 1)))
+                .setUpsertions(singletonList(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+                        .setName("user1")
+                        .setMechanism((byte) 1)
+                        .setIterations(4096)
+                        .setSalt(salt)
+                        .setSaltedPassword(saltedPassword)));
+        AlterUserScramCredentialsRequest.Builder builder = new AlterUserScramCredentialsRequest.Builder(data);
+        AlterUserScramCredentialsRequest request = builder.build();
+
+        String expected = "AlterUserScramCredentialsRequestData(" +
+                "deletions=[ScramCredentialDeletion(name='user2', mechanism=1)], " +
+                "upsertions=[ScramCredentialUpsertion(name='user1', mechanism=1, " +
+                "iterations=4096, salt=[], saltedPassword=[])])";
+        assertEquals(expected, request.toString());
+        assertEquals(expected, builder.toString());
+        // The original data must not be modified by toString()
+        assertEquals(Arrays.toString(salt), Arrays.toString(request.data().upsertions().get(0).salt()));
+        assertEquals(Arrays.toString(saltedPassword),
+                Arrays.toString(request.data().upsertions().get(0).saltedPassword()));
+    }
+
+    @Test
+    public void testDelegationTokenRequestsToStringMaskHmac() {
+        byte[] hmac = "sensitive-hmac".getBytes(StandardCharsets.UTF_8);
+
+        RenewDelegationTokenRequest.Builder renewBuilder = new RenewDelegationTokenRequest.Builder(
+                new RenewDelegationTokenRequestData().setHmac(hmac).setRenewPeriodMs(1000L));
+        RenewDelegationTokenRequest renewRequest = renewBuilder.build();
+        for (String str : asList(renewBuilder.toString(), renewRequest.toString())) {
+            assertTrue(str.contains("hmac=[]"), str);
+            assertFalse(str.contains(Arrays.toString(hmac)), str);
+        }
+        assertEquals(Arrays.toString(hmac), Arrays.toString(renewRequest.data().hmac()));
+
+        ExpireDelegationTokenRequest.Builder expireBuilder = new ExpireDelegationTokenRequest.Builder(
+                new ExpireDelegationTokenRequestData().setHmac(hmac).setExpiryTimePeriodMs(1000L));
+        ExpireDelegationTokenRequest expireRequest = expireBuilder.build();
+        for (String str : asList(expireBuilder.toString(), expireRequest.toString())) {
+            assertTrue(str.contains("hmac=[]"), str);
+            assertFalse(str.contains(Arrays.toString(hmac)), str);
+        }
+        assertEquals(Arrays.toString(hmac), Arrays.toString(expireRequest.data().hmac()));
+    }
+
+    @Test
+    public void testDelegationTokenResponsesToStringMaskTokenIdAndHmac() {
+        byte[] hmac = "sensitive-hmac".getBytes(StandardCharsets.UTF_8);
+        String tokenId = "sensitive-token-id";
+
+        CreateDelegationTokenResponse createResponse = new CreateDelegationTokenResponse(
+                new CreateDelegationTokenResponseData()
+                        .setPrincipalType("User")
+                        .setPrincipalName("user1")
+                        .setTokenId(tokenId)
+                        .setHmac(hmac));
+        String createStr = createResponse.toString();
+        assertTrue(createStr.contains("tokenId='REDACTED'"), createStr);
+        assertTrue(createStr.contains("hmac=[]"), createStr);
+        assertFalse(createStr.contains(tokenId), createStr);
+        assertFalse(createStr.contains(Arrays.toString(hmac)), createStr);
+        assertEquals(tokenId, createResponse.data().tokenId());
+
+        TokenInformation tokenInfo = new TokenInformation(tokenId, new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "user1"),
+                new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "user1"), emptyList(), 1000L, 2000L, 3000L);
+        DescribeDelegationTokenResponse describeResponse = new DescribeDelegationTokenResponse(
+                DESCRIBE_DELEGATION_TOKEN.latestVersion(), 20, Errors.NONE,
+                singletonList(new DelegationToken(tokenInfo, hmac)));
+        String describeStr = describeResponse.toString();
+        assertTrue(describeStr.contains("tokenId='REDACTED'"), describeStr);
+        assertTrue(describeStr.contains("hmac=[]"), describeStr);
+        assertFalse(describeStr.contains(tokenId), describeStr);
+        assertFalse(describeStr.contains(Arrays.toString(hmac)), describeStr);
+        assertEquals(tokenId, describeResponse.data().tokens().get(0).tokenId());
     }
 }
